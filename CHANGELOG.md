@@ -2,6 +2,38 @@
 
 <!-- Copyright © 2026 Sonomos, Inc. All rights reserved. -->
 
+## [1.4] - 2026-04-14
+
+### Added
+- **Data augmentation module** (`src/augment.py`): four strategies to improve
+  model robustness on limited real training data:
+  - **Multi-window extraction**: creates 4 additional copies of each training
+    sample simulating observation at 20%, 40%, 60%, 80% of the flow lifecycle
+    (zeroes out later first-N packet slots, scales duration/counts). Teaches the
+    model to classify flows from partial observations.
+  - **IAT jitter**: ±10% Gaussian noise on inter-arrival time features to
+    simulate network condition variation (congestion, route changes).
+  - **Packet size jitter**: ±5% noise on packet size features to simulate MTU
+    differences and TCP segmentation offload variation.
+  - **Feature-space mixup** (Zhang et al., 2018): convex interpolation between
+    same-class samples (flow features only, TLS/JA4/SNI preserved from first
+    parent). Smooths the decision boundary and regularizes.
+- **`--augment` flag** on `scripts/train.py`: enables all augmentation
+  strategies during training. Augmentation is applied to training data only,
+  never validation. A 10K sample dataset typically expands to ~70K+ samples.
+- 24 new tests for augmentation (`tests/test_augment.py`): shape preservation,
+  feature isolation (jitter only touches correct indices), multi-window zeroing,
+  mixup same-class constraint, determinism, class ratio preservation.
+
+### Changed
+- **XGBoost teacher tuned for maximum capacity**: defaults bumped from 500
+  trees / depth 6 / lr 0.1 to 1000 trees / depth 8 / lr 0.05. Early stopping
+  patience increased from 50 to 100 rounds. This gives the teacher more
+  capacity to learn, improving the soft targets used for MLP distillation.
+- `train.py` now imports and applies `augment_dataset()` when `--augment` is
+  passed. Teacher probability vectors are padded with -1 sentinels for augmented
+  samples that don't have teacher targets.
+
 ## [1.3] - 2026-04-14
 
 ### Changed

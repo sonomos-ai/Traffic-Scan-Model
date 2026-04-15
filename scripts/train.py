@@ -40,6 +40,7 @@ from sklearn.metrics import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from model import TrafficClassifier, FocalLoss, ConfidenceAwareLoss, DistillationLoss, export_onnx
 from features import NUM_FEATURES, FEATURE_NAMES
+from augment import augment_dataset
 
 
 def load_csv(path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -166,12 +167,32 @@ def train(
     patience: int = 20,
     focal_alpha: float = 0.75,
     focal_gamma: float = 2.0,
+    augment: bool = False,
 ) -> tuple[TrafficClassifier, dict]:
     """
     Full training loop with early stopping.
 
     Returns trained model and best validation metrics.
     """
+    # Apply data augmentation (training data only, never validation)
+    if augment:
+        print("  Applying data augmentation...")
+        n_before = len(X_train)
+        X_train, y_train = augment_dataset(
+            X_train, y_train,
+            multi_window=True,
+            iat_jitter=True,
+            pkt_size_jitter=True,
+            mixup_alpha=0.2,
+        )
+        print(f"  Augmentation: {n_before} → {len(X_train)} training samples")
+        # Teacher probs don't extend to augmented samples — disable distillation
+        # for augmented copies (they don't have teacher targets)
+        if teacher_probs_train is not None:
+            # Pad teacher probs with -1 sentinel for augmented samples
+            padding = np.full(len(X_train) - len(teacher_probs_train), -1.0, dtype=np.float32)
+            teacher_probs_train = np.concatenate([teacher_probs_train, padding])
+
     # Convert to tensors
     indices_train = np.arange(len(X_train))
     X_t = torch.tensor(X_train, dtype=torch.float32)
@@ -268,6 +289,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temporal-split", action="store_true",
                         help="Use temporal split (first 80%% train, last 20%% val)")
+    parser.add_argument("--augment", action="store_true",
+                        help="Apply data augmentation (multi-window, IAT jitter, pkt size jitter, mixup)")
     args = parser.parse_args()
 
     print(f"Loading data from {args.data}...")
@@ -320,6 +343,7 @@ def main():
             patience=args.patience,
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
+            augment=args.augment,
         )
         all_metrics.append(metrics)
         best_model = model

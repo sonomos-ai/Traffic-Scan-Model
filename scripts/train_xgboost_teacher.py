@@ -50,9 +50,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train XGBoost teacher")
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--n-estimators", type=int, default=500)
-    parser.add_argument("--max-depth", type=int, default=6)
-    parser.add_argument("--learning-rate", type=float, default=0.1)
+    parser.add_argument("--n-estimators", type=int, default=1000)
+    parser.add_argument("--max-depth", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -98,7 +98,7 @@ def main():
             dtrain,
             num_boost_round=args.n_estimators,
             evals=[(dval, "val")],
-            early_stopping_rounds=50,
+            early_stopping_rounds=100,
             verbose_eval=False,
         )
 

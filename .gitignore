@@ -8,3 +8,6 @@ build/
 models/*.json
 data/*.csv
 .venv/
+
+*.pcap
+*.pcapng
