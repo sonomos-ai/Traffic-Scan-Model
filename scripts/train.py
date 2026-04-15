@@ -38,7 +38,7 @@ from sklearn.metrics import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from model import TrafficClassifier, FocalLoss, DistillationLoss, export_onnx
+from model import TrafficClassifier, FocalLoss, ConfidenceAwareLoss, DistillationLoss, export_onnx
 from features import NUM_FEATURES, FEATURE_NAMES
 
 
@@ -96,13 +96,13 @@ def train_epoch(
 
     for batch_idx, (X_batch, y_batch, idx_batch) in enumerate(loader):
         optimizer.zero_grad()
-        logits = model(X_batch)
+        logits, confidence = model(X_batch)
 
         if teacher_probs is not None and isinstance(criterion, DistillationLoss):
             t_probs = teacher_probs[idx_batch]
-            loss = criterion(logits, y_batch, t_probs)
+            loss = criterion(logits, confidence, y_batch, t_probs)
         else:
-            loss = criterion(logits, y_batch)
+            loss = criterion(logits, confidence, y_batch)
 
         loss.backward()
         optimizer.step()
@@ -118,10 +118,11 @@ def evaluate(
     X: torch.Tensor,
     y: torch.Tensor,
 ) -> dict:
-    """Evaluate model, return metrics dict."""
+    """Evaluate model, return metrics dict including confidence stats."""
     model.eval()
-    logits = model(X)
+    logits, confidence = model(X)
     probs = torch.sigmoid(logits).cpu().numpy()
+    conf = confidence.cpu().numpy()
     y_np = y.cpu().numpy()
 
     preds = (probs >= 0.5).astype(float)
@@ -130,7 +131,16 @@ def evaluate(
         "auc_pr": average_precision_score(y_np, probs) if y_np.sum() > 0 else 0.0,
         "auc_roc": roc_auc_score(y_np, probs) if len(np.unique(y_np)) > 1 else 0.0,
         "f1": f1_score(y_np, preds, zero_division=0),
+        "conf_mean": float(conf.mean()),
+        "conf_std": float(conf.std()),
     }
+
+    # Confidence calibration: mean confidence on correct vs incorrect predictions
+    correct_mask = (preds == y_np)
+    if correct_mask.any():
+        metrics["conf_correct"] = float(conf[correct_mask].mean())
+    if (~correct_mask).any():
+        metrics["conf_incorrect"] = float(conf[~correct_mask].mean())
 
     # Precision at 90% recall
     if y_np.sum() > 0:
@@ -194,10 +204,14 @@ def train(
         criterion = DistillationLoss(
             alpha_hard=0.3, alpha_soft=0.7,
             focal_alpha=focal_alpha, focal_gamma=focal_gamma,
+            confidence_penalty=0.1,
         )
         t_probs_tensor = torch.tensor(teacher_probs_train, dtype=torch.float32)
     else:
-        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        criterion = ConfidenceAwareLoss(
+            focal_alpha=focal_alpha, focal_gamma=focal_gamma,
+            confidence_penalty=0.1,
+        )
         t_probs_tensor = None
 
     # Training loop with early stopping
@@ -216,7 +230,8 @@ def train(
             print(
                 f"  Epoch {epoch+1:3d} | loss={loss:.4f} | "
                 f"AUC-PR={metrics['auc_pr']:.4f} | F1={metrics['f1']:.4f} | "
-                f"P@R90={metrics['precision_at_90_recall']:.4f} | lr={lr_now:.2e}"
+                f"P@R90={metrics['precision_at_90_recall']:.4f} | "
+                f"conf={metrics['conf_mean']:.3f}±{metrics['conf_std']:.3f} | lr={lr_now:.2e}"
             )
 
             if metrics["auc_pr"] > best_auc_pr:

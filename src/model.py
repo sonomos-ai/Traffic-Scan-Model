@@ -2,10 +2,23 @@
 # All rights reserved.
 
 """
-Sonomos Traffic Classifier — Model Definition
+Sonomos Traffic Classifier — Two-Head Model Definition
 
-61→96→48→1 dense network (~10,993 params) for binary classification
-of AI provider traffic from TLS/HTTPS metadata features.
+61→96→48→{logit, confidence} dense network (~11K params) for binary
+classification of AI provider traffic from TLS/HTTPS metadata features.
+
+Two outputs:
+  - logit:      raw classification score (sigmoid → P(AI traffic))
+  - confidence: learned confidence score in [0, 1] indicating how much
+                the model trusts its own prediction. Low confidence
+                signals "I don't know" and the pipeline should fall back
+                to a more conservative action.
+
+The confidence head is trained using the DeVries & Taylor (2018) trick:
+the prediction is interpolated between the model's output and the true
+label, weighted by confidence. This gives the model two ways to minimize
+loss: (a) predict correctly with high confidence, or (b) admit uncertainty
+with low confidence. A budget penalty prevents trivial c=0 solutions.
 """
 
 import torch
@@ -38,14 +51,17 @@ class FocalLoss(nn.Module):
 
 class TrafficClassifier(nn.Module):
     """
-    Tiny MLP binary classifier for AI traffic detection.
+    Two-head MLP binary classifier for AI traffic detection.
 
-    Architecture: 61 → 96 → 48 → 1
-    Parameters:  ~10,705 (+ 288 for BatchNorm = ~10,993 total, folded at inference)
-    Output:      raw logit (apply sigmoid for probability)
+    Architecture: 61 → 96 → 48 → {logit(1), confidence(1)}
+    Parameters:  ~11K (+ BatchNorm, folded at inference by tract)
 
-    During ONNX export, BatchNorm layers are folded into preceding linear
-    layers by tract's optimizer, so runtime cost is pure matmul.
+    Outputs (forward):
+        logit:      raw classification score, shape (batch,)
+        confidence: learned confidence in [0, 1], shape (batch,)
+
+    During ONNX export, both outputs are concatenated into a single
+    (1, 2) tensor: [logit, confidence].
     """
 
     NUM_FEATURES = 61
@@ -54,7 +70,8 @@ class TrafficClassifier(nn.Module):
 
     def __init__(self, dropout: float = 0.1):
         super().__init__()
-        self.net = nn.Sequential(
+        # Shared backbone
+        self.backbone = nn.Sequential(
             nn.Linear(self.NUM_FEATURES, self.HIDDEN_1),
             nn.BatchNorm1d(self.HIDDEN_1),
             nn.ReLU(),
@@ -63,32 +80,109 @@ class TrafficClassifier(nn.Module):
             nn.BatchNorm1d(self.HIDDEN_2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(self.HIDDEN_2, 1),
         )
+        # Classification head: raw logit
+        self.head_logit = nn.Linear(self.HIDDEN_2, 1)
+        # Confidence head: learned confidence score
+        self.head_confidence = nn.Linear(self.HIDDEN_2, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.backbone(x)
+        logit = self.head_logit(h).squeeze(-1)
+        confidence = torch.sigmoid(self.head_confidence(h).squeeze(-1))
+        return logit, confidence
 
-    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Return P(AI traffic) in [0, 1]."""
+    def forward_onnx(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        ONNX-compatible forward: returns (1, 2) tensor [logit, confidence].
+        Used only during export — tract reads both values from a single output.
+        """
+        logit, confidence = self.forward(x)
+        return torch.stack([logit, confidence], dim=-1)
+
+    def predict_proba(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (P(AI traffic), confidence) both in [0, 1]."""
         with torch.no_grad():
-            return torch.sigmoid(self.forward(x))
+            logit, confidence = self.forward(x)
+            return torch.sigmoid(logit), confidence
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
 
-class DistillationLoss(nn.Module):
+class ConfidenceAwareLoss(nn.Module):
     """
-    Combined loss for XGBoost→MLP knowledge distillation.
+    Confidence-aware loss (DeVries & Taylor, 2018).
 
-    Blends hard label loss (focal) with soft teacher probability loss (MSE).
+    The model outputs a prediction p and confidence c. The effective
+    prediction is interpolated: p' = c * p + (1 - c) * y, where y is
+    the true label. This gives the model two ways to minimize loss:
+      (a) predict correctly with high confidence
+      (b) admit uncertainty with low confidence (peek at the label)
+
+    A budget penalty -log(c) prevents the trivial c=0 solution.
 
     Args:
-        alpha_hard: Weight for focal loss on true labels.
+        focal_alpha: Focal loss class weight for the classification term.
+        focal_gamma: Focal loss focusing parameter.
+        confidence_penalty: Weight for the -log(c) budget term. Higher
+            values force the model to be more confident. Start with 0.1.
+    """
+
+    def __init__(
+        self,
+        focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0,
+        confidence_penalty: float = 0.1,
+    ):
+        super().__init__()
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.confidence_penalty = confidence_penalty
+
+    def forward(
+        self,
+        logit: torch.Tensor,
+        confidence: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        # Classification probability
+        prob = torch.sigmoid(logit)
+
+        # Interpolated prediction: if confident, use own prediction;
+        # if not, peek at the true label
+        prob_adjusted = confidence * prob + (1.0 - confidence) * targets
+
+        # Focal-weighted BCE on the adjusted prediction
+        # We compute BCE manually since prob_adjusted is already a probability
+        eps = 1e-7
+        bce = -(targets * torch.log(prob_adjusted + eps)
+                + (1 - targets) * torch.log(1 - prob_adjusted + eps))
+
+        p_t = torch.where(targets == 1, prob_adjusted, 1 - prob_adjusted)
+        alpha_t = self.focal_alpha * targets + (1 - self.focal_alpha) * (1 - targets)
+        focal_weight = alpha_t * (1 - p_t) ** self.focal_gamma
+        classification_loss = (focal_weight * bce).mean()
+
+        # Budget penalty: prevent trivial c=0 by penalizing low confidence
+        confidence_loss = -torch.log(confidence + eps).mean()
+
+        return classification_loss + self.confidence_penalty * confidence_loss
+
+
+class DistillationLoss(nn.Module):
+    """
+    Combined loss for XGBoost→MLP knowledge distillation with confidence.
+
+    Blends hard label loss (confidence-aware focal) with soft teacher
+    probability loss (MSE on the classification head only).
+
+    Args:
+        alpha_hard: Weight for confidence-aware focal loss on true labels.
         alpha_soft: Weight for MSE loss against teacher probabilities.
         focal_alpha: Focal loss class weight.
         focal_gamma: Focal loss focusing parameter.
+        confidence_penalty: Weight for confidence budget penalty.
     """
 
     def __init__(
@@ -97,23 +191,29 @@ class DistillationLoss(nn.Module):
         alpha_soft: float = 0.7,
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
+        confidence_penalty: float = 0.1,
     ):
         super().__init__()
         self.alpha_hard = alpha_hard
         self.alpha_soft = alpha_soft
-        self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.conf_loss = ConfidenceAwareLoss(
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            confidence_penalty=confidence_penalty,
+        )
         self.mse = nn.MSELoss()
 
     def forward(
         self,
-        logits: torch.Tensor,
+        logit: torch.Tensor,
+        confidence: torch.Tensor,
         targets: torch.Tensor,
         teacher_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hard_loss = self.focal(logits, targets)
+        hard_loss = self.conf_loss(logit, confidence, targets)
         if teacher_probs is None:
             return hard_loss
-        student_probs = torch.sigmoid(logits)
+        student_probs = torch.sigmoid(logit)
         soft_loss = self.mse(student_probs, teacher_probs)
         return self.alpha_hard * hard_loss + self.alpha_soft * soft_loss
 
@@ -126,11 +226,56 @@ def export_onnx(
     """
     Export trained model to ONNX for tract inference.
 
-    Uses opset 17, fixed input shape (1, 40), constant folding enabled.
-    Verify with: tract traffic_classifier.onnx -i 1,40,f32 dump
+    Output shape is (1, 2): [logit, confidence].
+    Apply sigmoid to logit for P(AI). Confidence is already in [0, 1].
+
+    Verify with: tract traffic_classifier.onnx -i 1,61,f32 dump
     """
     model.eval()
     dummy_input = torch.randn(1, TrafficClassifier.NUM_FEATURES)
+
+    # Use the ONNX-compatible forward that returns a single (1, 2) tensor
+    torch.onnx.export(
+        model,
+        dummy_input,
+        output_path,
+        opset_version=opset_version,
+        input_names=["features"],
+        output_names=["output"],
+        do_constant_folding=True,
+        dynamic_axes=None,
+    )
+    print(f"Exported ONNX model to {output_path}")
+    print(f"  Parameters: {model.count_parameters()}")
+    print(f"  Input shape: (1, {TrafficClassifier.NUM_FEATURES})")
+    print(f"  Output shape: (1, 2) = [logit, confidence]")
+
+
+# Override forward for ONNX export compatibility
+_original_forward = TrafficClassifier.forward
+
+
+def _patched_forward_for_export(self, x):
+    """During ONNX export, use forward_onnx to produce single tensor output."""
+    return self.forward_onnx(x)
+
+
+def export_onnx(
+    model: TrafficClassifier,
+    output_path: str,
+    opset_version: int = 17,
+) -> None:
+    """
+    Export trained model to ONNX for tract inference.
+
+    Output shape is (1, 2): [logit, confidence].
+    Apply sigmoid to logit for P(AI). Confidence is already in [0, 1].
+    """
+    model.eval()
+    dummy_input = torch.randn(1, TrafficClassifier.NUM_FEATURES)
+
+    # Temporarily swap forward to produce single-tensor output for ONNX
+    model.forward = lambda x: model.forward_onnx(x)
 
     torch.onnx.export(
         model,
@@ -138,11 +283,15 @@ def export_onnx(
         output_path,
         opset_version=opset_version,
         input_names=["features"],
-        output_names=["logit"],
+        output_names=["output"],
         do_constant_folding=True,
-        dynamic_axes=None,  # fixed shape for tract optimization
+        dynamic_axes=None,
     )
+
+    # Restore original forward
+    model.forward = lambda x: _original_forward(model, x)
+
     print(f"Exported ONNX model to {output_path}")
     print(f"  Parameters: {model.count_parameters()}")
     print(f"  Input shape: (1, {TrafficClassifier.NUM_FEATURES})")
-    print(f"  Output: raw logit (apply sigmoid for probability)")
+    print(f"  Output shape: (1, 2) = [logit, confidence]")

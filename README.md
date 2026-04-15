@@ -11,8 +11,15 @@ traffic from TLS/HTTPS metadata. Designed for sub-100μs inference via
 ```
 Input (61 features) → Linear(96) → BatchNorm → ReLU → Dropout(0.1)
                      → Linear(48) → BatchNorm → ReLU → Dropout(0.1)
-                     → Linear(1)  → Sigmoid → P(AI traffic)
+                     ├→ Linear(1)  → logit      → sigmoid → P(AI traffic)
+                     └→ Linear(1)  → sigmoid    → confidence score [0, 1]
 ```
+
+ONNX output: `(1, 2)` = `[logit, confidence]`
+
+The confidence head tells the pipeline how much to trust the prediction.
+Low confidence (< 0.4) signals "I don't know" — the pipeline falls back to
+conservative behavior instead of acting on an uncertain classification.
 
 **Stage 3** of the Sonomos Desktop three-stage traffic scanning pipeline:
 
@@ -119,8 +126,10 @@ Target metrics (on real data):
 - AUC-PR > 0.95
 - F1 > 0.92
 - Precision@90%Recall > 0.90
+- Confidence: mean > 0.7 on correct, mean < 0.5 on incorrect
 - Inference: <100μs (tract, x86_64)
-- Model size: ~45KB (FP32 ONNX)
+- Model size: ~50KB (FP32 ONNX)
+- Output: (1, 2) = [logit, confidence]
 
 ## License
 

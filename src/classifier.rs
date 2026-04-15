@@ -429,37 +429,101 @@ pub fn build_feature_vector(
     features
 }
 
-// --- Domain cache ---
+// --- EMA domain cache ---
 
-/// Per-domain result cache. Keyed by SNI domain.
+/// Per-domain classification entry with exponential moving average.
+///
+/// Instead of storing a single probability per domain, maintains a
+/// running EMA across multiple flows. A domain that triggers 0.7 on
+/// one flow might be noise, but consistent 0.6–0.8 across 5 flows
+/// is a strong signal.
+#[derive(Clone, Debug)]
+struct DomainEntry {
+    /// EMA of P(AI traffic) across flows to this domain.
+    probability_ema: f32,
+    /// EMA of model confidence across flows to this domain.
+    confidence_ema: f32,
+    /// Number of flows observed to this domain.
+    flow_count: u32,
+}
+
+/// EMA-based per-domain result cache. Keyed by SNI domain.
+///
+/// On first observation, stores the raw probability. On subsequent
+/// observations, blends the new value with the running average using
+/// an exponential decay factor (alpha). This smooths out per-flow
+/// noise and builds conviction over time.
 struct DomainCache {
-    cache: RwLock<HashMap<String, f32>>,
+    cache: RwLock<HashMap<String, DomainEntry>>,
+    /// EMA decay factor. Higher = more weight on recent observations.
+    /// Default 0.3: new observation gets 30% weight.
+    alpha: f32,
 }
 
 impl DomainCache {
-    fn new() -> Self {
+    fn new(alpha: f32) -> Self {
         Self {
             cache: RwLock::new(HashMap::with_capacity(1024)),
+            alpha,
         }
     }
 
-    fn get(&self, domain: &str) -> Option<f32> {
-        self.cache.read().ok()?.get(domain).copied()
+    fn get(&self, domain: &str) -> Option<DomainEntry> {
+        self.cache.read().ok()?.get(domain).cloned()
     }
 
-    fn set(&self, domain: String, probability: f32) {
+    /// Update the EMA for a domain with a new observation.
+    fn update(&self, domain: String, probability: f32, confidence: f32) {
         if let Ok(mut cache) = self.cache.write() {
-            cache.insert(domain, probability);
+            let entry = cache.entry(domain).or_insert(DomainEntry {
+                probability_ema: probability,
+                confidence_ema: confidence,
+                flow_count: 0,
+            });
+
+            if entry.flow_count == 0 {
+                // First observation: store raw values
+                entry.probability_ema = probability;
+                entry.confidence_ema = confidence;
+            } else {
+                // EMA update: new = alpha * observation + (1 - alpha) * old
+                entry.probability_ema =
+                    self.alpha * probability + (1.0 - self.alpha) * entry.probability_ema;
+                entry.confidence_ema =
+                    self.alpha * confidence + (1.0 - self.alpha) * entry.confidence_ema;
+            }
+            entry.flow_count += 1;
         }
     }
+}
+
+// --- Classification result ---
+
+/// Result of classifying a flow, including confidence and EMA state.
+#[derive(Debug, Clone)]
+pub struct ClassificationResult {
+    /// P(AI traffic) for this individual flow.
+    pub probability: f32,
+    /// Model's learned confidence in its prediction for this flow.
+    pub confidence: f32,
+    /// EMA-smoothed P(AI traffic) across all flows to this domain.
+    pub ema_probability: f32,
+    /// EMA-smoothed confidence across all flows to this domain.
+    pub ema_confidence: f32,
+    /// Whether this flow is classified as AI traffic (ema_probability > threshold).
+    pub is_ai: bool,
+    /// Number of flows observed to this domain so far.
+    pub domain_flow_count: u32,
 }
 
 // --- ML classifier ---
 
-/// The Stage 3 ML classifier.
+/// The Stage 3 ML classifier with two-head output and EMA domain cache.
 ///
-/// Wraps a tract-optimized ONNX model with a per-domain result cache.
-/// Thread-safe: the optimized model plan is immutable after construction.
+/// Model output is (1, 2): [logit, confidence].
+/// The domain cache maintains exponential moving averages across flows,
+/// building conviction over time. A single-flow anomaly won't flip a
+/// domain's classification, but consistent signals will.
 pub struct TrafficClassifier {
     model: SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
     cache: DomainCache,
@@ -468,7 +532,16 @@ pub struct TrafficClassifier {
 
 impl TrafficClassifier {
     /// Load the ONNX model from disk. Call once at daemon startup.
-    pub fn load(model_path: &str, threshold: Option<f32>) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to the ONNX model file
+    /// * `threshold` - Classification threshold (default 0.5)
+    /// * `ema_alpha` - EMA decay factor for domain cache (default 0.3)
+    pub fn load(
+        model_path: &str,
+        threshold: Option<f32>,
+        ema_alpha: Option<f32>,
+    ) -> Result<Self> {
         let model = tract_onnx::onnx()
             .model_for_path(model_path)?
             .with_input_fact(
@@ -480,56 +553,79 @@ impl TrafficClassifier {
 
         Ok(Self {
             model,
-            cache: DomainCache::new(),
+            cache: DomainCache::new(ema_alpha.unwrap_or(0.3)),
             threshold: threshold.unwrap_or(DEFAULT_THRESHOLD),
         })
     }
 
     /// Classify a flow using precomputed features.
     ///
-    /// Returns `(probability, is_ai_traffic)`.
-    /// Checks the domain cache first; on miss, runs inference and caches.
-    pub fn classify(&self, features: &[f32; NUM_FEATURES], domain: &str) -> Result<(f32, bool)> {
-        if !domain.is_empty() {
-            if let Some(cached_prob) = self.cache.get(domain) {
-                return Ok((cached_prob, cached_prob > self.threshold));
-            }
-        }
-
+    /// Returns a `ClassificationResult` with per-flow probability/confidence
+    /// and EMA-smoothed domain-level values.
+    ///
+    /// The `is_ai` decision uses the EMA probability, not the single-flow
+    /// probability. This means a domain needs consistent high-probability
+    /// signals across multiple flows before being classified as AI.
+    pub fn classify(
+        &self,
+        features: &[f32; NUM_FEATURES],
+        domain: &str,
+    ) -> Result<ClassificationResult> {
+        // Run inference: model outputs (1, 2) = [logit, confidence]
         let input = tract_ndarray::Array2::from_shape_vec(
             (1, NUM_FEATURES),
             features.to_vec(),
         )?;
 
         let output = self.model.run(tvec![input.into_tensor()])?;
-        let logit = output[0].to_array_view::<f32>()?[[0, 0]];
-        let probability = 1.0 / (1.0 + (-logit).exp());
-        let is_ai = probability > self.threshold;
+        let output_view = output[0].to_array_view::<f32>()?;
+        let logit = output_view[[0, 0]];
+        let confidence = output_view[[0, 1]];
 
+        let probability = 1.0 / (1.0 + (-logit).exp());
+        // Confidence is already sigmoid'd by the model, but clamp for safety
+        let confidence = confidence.clamp(0.0, 1.0);
+
+        // Update EMA cache
         if !domain.is_empty() {
-            self.cache.set(domain.to_string(), probability);
+            self.cache.update(domain.to_string(), probability, confidence);
         }
 
-        Ok((probability, is_ai))
+        // Get EMA values (will reflect the update we just made)
+        let (ema_prob, ema_conf, flow_count) = if !domain.is_empty() {
+            if let Some(entry) = self.cache.get(domain) {
+                (entry.probability_ema, entry.confidence_ema, entry.flow_count)
+            } else {
+                (probability, confidence, 1)
+            }
+        } else {
+            (probability, confidence, 0)
+        };
+
+        Ok(ClassificationResult {
+            probability,
+            confidence,
+            ema_probability: ema_prob,
+            ema_confidence: ema_conf,
+            is_ai: ema_prob > self.threshold,
+            domain_flow_count: flow_count,
+        })
     }
 
     /// Full pipeline: extract TLS features via huginn-net-tls, build feature
     /// vector, and classify in one call.
-    ///
-    /// This is the highest-level API. The daemon passes raw flow data and
-    /// the ClientHello bytes; everything else is handled internally.
     pub fn classify_flow(
         &self,
         flow: &FlowStats,
         client_hello: &[u8],
-    ) -> Result<(f32, bool, String)> {
+    ) -> Result<(ClassificationResult, String)> {
         let (tls, ja4, sni) = extract_tls_metadata(client_hello)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse ClientHello"))?;
 
         let features = build_feature_vector(flow, &tls, &ja4, &sni);
-        let (prob, is_ai) = self.classify(&features, &sni)?;
+        let result = self.classify(&features, &sni)?;
 
-        Ok((prob, is_ai, sni))
+        Ok((result, sni))
     }
 
     pub fn set_threshold(&mut self, threshold: f32) {
@@ -560,17 +656,24 @@ impl TrafficClassifier {
 //     }
 //
 //     // Stage 2: Heuristic scoring (~μs)
-//     // huginn-net-tls extracts JA4 + TLS metadata here
 //     if let Some((tls, ja4, sni)) = extract_tls_metadata(&flow.client_hello) {
 //         let heuristic = compute_heuristic_score(&tls, &ja4, &sni);
 //         if heuristic > HIGH_CONFIDENCE { return TrafficDecision::Ai(heuristic); }
 //         if heuristic < LOW_CONFIDENCE  { return TrafficDecision::Normal(heuristic); }
 //     }
 //
-//     // Stage 3: ML classifier (~10-70ms cold, <100μs warm)
+//     // Stage 3: ML classifier with confidence + EMA
 //     match classifier.classify_flow(&flow.stats, &flow.client_hello) {
-//         Ok((prob, true, sni))  => TrafficDecision::Ai(prob),
-//         Ok((prob, false, sni)) => TrafficDecision::Normal(prob),
+//         Ok((result, sni)) => {
+//             if result.confidence < 0.4 {
+//                 // Model is unsure — treat conservatively
+//                 TrafficDecision::Unknown
+//             } else if result.is_ai {
+//                 TrafficDecision::Ai(result.ema_probability)
+//             } else {
+//                 TrafficDecision::Normal(result.ema_probability)
+//             }
+//         }
 //         Err(_) => TrafficDecision::Unknown,
 //     }
 // }
@@ -697,5 +800,68 @@ mod tests {
         assert!((mean - 0.4).abs() < 0.01); // 600/1500
         assert!(std > 0.0);
         assert!((median - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ema_cache_first_observation() {
+        let cache = DomainCache::new(0.3);
+        cache.update("test.com".into(), 0.8, 0.9);
+        let entry = cache.get("test.com").unwrap();
+        assert_eq!(entry.probability_ema, 0.8);
+        assert_eq!(entry.confidence_ema, 0.9);
+        assert_eq!(entry.flow_count, 1);
+    }
+
+    #[test]
+    fn test_ema_cache_blending() {
+        let cache = DomainCache::new(0.3); // alpha = 0.3
+        cache.update("test.com".into(), 0.8, 0.9);
+        cache.update("test.com".into(), 0.2, 0.5);
+
+        let entry = cache.get("test.com").unwrap();
+        // EMA: 0.3 * 0.2 + 0.7 * 0.8 = 0.06 + 0.56 = 0.62
+        assert!((entry.probability_ema - 0.62).abs() < 0.01);
+        // EMA: 0.3 * 0.5 + 0.7 * 0.9 = 0.15 + 0.63 = 0.78
+        assert!((entry.confidence_ema - 0.78).abs() < 0.01);
+        assert_eq!(entry.flow_count, 2);
+    }
+
+    #[test]
+    fn test_ema_cache_convergence() {
+        let cache = DomainCache::new(0.3);
+        // Feed consistent 0.9 signals — EMA should converge toward 0.9
+        for _ in 0..20 {
+            cache.update("ai.com".into(), 0.9, 0.95);
+        }
+        let entry = cache.get("ai.com").unwrap();
+        assert!((entry.probability_ema - 0.9).abs() < 0.01);
+        assert_eq!(entry.flow_count, 20);
+    }
+
+    #[test]
+    fn test_ema_cache_noise_rejection() {
+        let cache = DomainCache::new(0.3);
+        // Build up strong "not AI" signal
+        for _ in 0..10 {
+            cache.update("normal.com".into(), 0.1, 0.9);
+        }
+        // Single noisy observation shouldn't flip the classification
+        cache.update("normal.com".into(), 0.8, 0.3);
+        let entry = cache.get("normal.com").unwrap();
+        // EMA should still be well below 0.5
+        assert!(entry.probability_ema < 0.3,
+            "Single noisy observation should not flip EMA: {}", entry.probability_ema);
+    }
+
+    #[test]
+    fn test_ema_cache_independent_domains() {
+        let cache = DomainCache::new(0.3);
+        cache.update("a.com".into(), 0.9, 0.8);
+        cache.update("b.com".into(), 0.1, 0.8);
+
+        let a = cache.get("a.com").unwrap();
+        let b = cache.get("b.com").unwrap();
+        assert!((a.probability_ema - 0.9).abs() < 0.01);
+        assert!((b.probability_ema - 0.1).abs() < 0.01);
     }
 }

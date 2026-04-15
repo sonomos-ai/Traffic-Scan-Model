@@ -2,6 +2,43 @@
 
 <!-- Copyright © 2026 Sonomos, Inc. All rights reserved. -->
 
+## [1.3] - 2026-04-14
+
+### Changed
+- **Two-head model output**: Model now outputs `(logit, confidence)` instead of
+  a single logit. The confidence head is a learned score in [0, 1] indicating
+  how much the model trusts its own prediction. Low confidence signals the
+  pipeline should fall back to a more conservative action rather than treating
+  P=0.51 the same as P=0.99.
+  - Architecture: 61 → 96 → 48 → {logit(1), confidence(1)}
+  - ONNX output shape changed from (1, 1) to (1, 2): [logit, confidence]
+  - Parameter count: ~11K → ~11.1K (+49 for confidence head linear layer)
+- **ConfidenceAwareLoss** replaces raw FocalLoss as the default training
+  criterion. Uses the DeVries & Taylor (2018) interpolation trick: the
+  prediction is blended between the model output and the true label, weighted
+  by confidence. A -log(c) budget penalty prevents trivial c=0 solutions.
+- **DistillationLoss** updated to pass confidence through to ConfidenceAwareLoss
+  for the hard-label component.
+- **EMA domain cache** (Rust): Replaced single-value per-domain cache with
+  exponential moving average. Each domain tracks `probability_ema`,
+  `confidence_ema`, and `flow_count`. New observations are blended with a
+  configurable alpha (default 0.3). A single noisy flow won't flip a domain's
+  classification, but consistent signals will converge.
+  - `ClassificationResult` struct exposes per-flow values and EMA values
+  - `TrafficClassifier::load()` accepts optional `ema_alpha` parameter
+  - `classify()` returns `ClassificationResult` instead of `(f32, bool)`
+- Training loop logs confidence stats: `conf=mean±std` per epoch.
+- Evaluation reports `conf_correct` and `conf_incorrect` (mean confidence on
+  correct vs incorrect predictions) for calibration monitoring.
+- `validate_onnx.py` updated for (1, 2) output shape and confidence
+  distribution sanity check.
+
+### Breaking Changes
+- ONNX model output shape changed from (1, 1) to (1, 2)
+- Rust `classify()` returns `ClassificationResult` instead of `(f32, bool)`
+- Rust `TrafficClassifier::load()` signature changed (added `ema_alpha`)
+- Previously trained models are incompatible; retrain required
+
 ## [1.2] - 2026-04-14
 
 ### Added

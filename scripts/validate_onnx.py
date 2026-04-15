@@ -6,7 +6,8 @@ Validate exported ONNX model for tract compatibility.
 
 Checks:
   - ONNX model loads and has correct I/O shapes
-  - Inference produces valid probabilities
+  - Output shape is (1, 2): [logit, confidence]
+  - Inference produces valid probabilities and confidence scores
   - Model output matches PyTorch reference
   - Opset version is tract-compatible
   - Model size is within budget
@@ -60,9 +61,7 @@ def validate(model_path: str) -> bool:
     # 3. I/O shapes
     print("3. Checking I/O shapes...")
     input_shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
-    output_shape = [d.dim_value for d in model.graph.output[0].type.tensor_type.shape.dim]
     print(f"   Input:  {model.graph.input[0].name} shape={input_shape}")
-    print(f"   Output: {model.graph.output[0].name} shape={output_shape}")
 
     if input_shape == [1, NUM_FEATURES]:
         print(f"   ✓ Input shape matches (1, {NUM_FEATURES})")
@@ -70,14 +69,24 @@ def validate(model_path: str) -> bool:
         print(f"   ✗ Expected input (1, {NUM_FEATURES}), got {input_shape}")
         passed = False
 
+    # Check output shape — should be (1, 2) for [logit, confidence]
+    output_shape = [d.dim_value for d in model.graph.output[0].type.tensor_type.shape.dim]
+    print(f"   Output: {model.graph.output[0].name} shape={output_shape}")
+
+    if output_shape == [1, 2]:
+        print(f"   ✓ Output shape matches (1, 2) = [logit, confidence]")
+    else:
+        print(f"   ✗ Expected output (1, 2), got {output_shape}")
+        passed = False
+
     # 4. Model size
     size_bytes = os.path.getsize(model_path)
     size_kb = size_bytes / 1024
     print(f"4. Model size: {size_kb:.1f} KB")
-    if size_kb < 100:
-        print("   ✓ Under 100KB budget")
+    if size_kb < 150:
+        print("   ✓ Under 150KB budget")
     else:
-        print(f"   ⚠ Larger than expected for ~5K params")
+        print(f"   ⚠ Larger than expected for ~11K params")
 
     # 5. Inference test
     print("5. Running inference test...")
@@ -86,23 +95,35 @@ def validate(model_path: str) -> bool:
     # Test with zeros
     zeros = np.zeros((1, NUM_FEATURES), dtype=np.float32)
     out = session.run(None, {"features": zeros})[0]
-    logit_zero = float(out[0])
+    assert out.shape == (1, 2), f"Expected (1, 2), got {out.shape}"
+    logit_zero = float(out[0, 0])
+    conf_zero = float(out[0, 1])
     prob_zero = 1.0 / (1.0 + np.exp(-logit_zero))
-    print(f"   Zero input:   logit={logit_zero:.4f}, prob={prob_zero:.4f}")
+    print(f"   Zero input:   logit={logit_zero:.4f}, prob={prob_zero:.4f}, conf={conf_zero:.4f}")
+
+    # Validate confidence range
+    if not (0.0 <= conf_zero <= 1.0):
+        print(f"   ✗ Confidence out of [0, 1] range: {conf_zero}")
+        passed = False
 
     # Test with random inputs
     rng = np.random.default_rng(42)
     for i in range(5):
         x = rng.uniform(-1, 1, (1, NUM_FEATURES)).astype(np.float32)
         out = session.run(None, {"features": x})[0]
-        logit = float(out[0])
+        logit = float(out[0, 0])
+        conf = float(out[0, 1])
         prob = 1.0 / (1.0 + np.exp(-logit))
         if not (0.0 <= prob <= 1.0):
             print(f"   ✗ Invalid probability: {prob}")
             passed = False
             break
+        if not (0.0 <= conf <= 1.0):
+            print(f"   ✗ Invalid confidence: {conf}")
+            passed = False
+            break
     else:
-        print("   ✓ All random inputs produce valid probabilities")
+        print("   ✓ All random inputs produce valid probability and confidence")
 
     # 6. Operator audit
     print("6. Operator audit...")
@@ -111,12 +132,11 @@ def validate(model_path: str) -> bool:
         ops.add(node.op_type)
     print(f"   Operators used: {sorted(ops)}")
 
-    # Operators known to be supported by tract
     tract_safe = {
         "Gemm", "MatMul", "Add", "Relu", "Sigmoid", "BatchNormalization",
         "Dropout", "Reshape", "Flatten", "Squeeze", "Unsqueeze",
         "Constant", "ConstantOfShape", "Shape", "Gather", "Cast",
-        "Mul", "Sub", "Div", "Concat", "Identity",
+        "Mul", "Sub", "Div", "Concat", "Identity", "Stack",
     }
     unsupported = ops - tract_safe
     if unsupported:
@@ -125,15 +145,13 @@ def validate(model_path: str) -> bool:
     else:
         print("   ✓ All operators are tract-safe")
 
-    # 7. Latency estimate
+    # 7. Latency benchmark
     print("7. Latency benchmark (onnxruntime, 1000 iterations)...")
     import time
 
     x = rng.uniform(-1, 1, (1, NUM_FEATURES)).astype(np.float32)
-    # Warmup
     for _ in range(100):
         session.run(None, {"features": x})
-    # Benchmark
     start = time.perf_counter_ns()
     for _ in range(1000):
         session.run(None, {"features": x})
@@ -141,6 +159,22 @@ def validate(model_path: str) -> bool:
     avg_us = elapsed_ns / 1000 / 1000
     print(f"   ORT avg: {avg_us:.1f} μs/inference")
     print(f"   (tract will be faster — pure Rust, no Python overhead)")
+
+    # 8. Confidence head sanity check
+    print("8. Confidence head sanity check...")
+    # Generate many random inputs and check confidence distribution
+    X_rand = rng.uniform(-1, 1, (100, NUM_FEATURES)).astype(np.float32)
+    confs = []
+    for i in range(100):
+        out = session.run(None, {"features": X_rand[i:i+1]})[0]
+        confs.append(float(out[0, 1]))
+    confs = np.array(confs)
+    print(f"   Confidence distribution: mean={confs.mean():.3f}, "
+          f"std={confs.std():.3f}, min={confs.min():.3f}, max={confs.max():.3f}")
+    if confs.std() < 0.001:
+        print("   ⚠ Confidence has near-zero variance (may not be trained yet)")
+    else:
+        print("   ✓ Confidence head shows variance")
 
     print(f"\n{'='*40}")
     if passed:
