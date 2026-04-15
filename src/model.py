@@ -4,7 +4,7 @@
 """
 Sonomos Traffic Classifier — Model Definition
 
-40→64→32→1 dense network (4,737 params) for binary classification
+61→96→48→1 dense network (~10,993 params) for binary classification
 of AI provider traffic from TLS/HTTPS metadata features.
 """
 
@@ -40,17 +40,17 @@ class TrafficClassifier(nn.Module):
     """
     Tiny MLP binary classifier for AI traffic detection.
 
-    Architecture: 40 → 64 → 32 → 1
-    Parameters:  4,737 (+ 192 for BatchNorm = 4,929 total, folded at inference)
+    Architecture: 61 → 96 → 48 → 1
+    Parameters:  ~10,705 (+ 288 for BatchNorm = ~10,993 total, folded at inference)
     Output:      raw logit (apply sigmoid for probability)
 
     During ONNX export, BatchNorm layers are folded into preceding linear
     layers by tract's optimizer, so runtime cost is pure matmul.
     """
 
-    NUM_FEATURES = 40
-    HIDDEN_1 = 64
-    HIDDEN_2 = 32
+    NUM_FEATURES = 61
+    HIDDEN_1 = 96
+    HIDDEN_2 = 48
 
     def __init__(self, dropout: float = 0.1):
         super().__init__()

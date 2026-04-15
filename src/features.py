@@ -4,12 +4,13 @@
 """
 Feature extraction for the Sonomos Traffic Classifier.
 
-Converts raw flow metadata into a 40-dimension numeric feature vector:
-  [0:16]  Flow statistics (packet sizes, IATs, duration, counts, throughput)
-  [16:24] First-N packet sizes (first 8 packets, upstream/downstream interleaved)
-  [24:31] TLS handshake metadata
-  [31:37] JA4 fingerprint components
-  [37:40] SNI character n-gram hash
+Converts raw flow metadata into a 61-dimension numeric feature vector:
+  [0:24]  Flow statistics (packet sizes, IATs, duration, counts, throughput,
+          directional stats, asymmetry ratios)
+  [24:32] First-N packet sizes (first 8 packets, upstream/downstream interleaved)
+  [32:44] TLS handshake metadata (7 base + 5 extension fingerprint flags)
+  [44:50] JA4 fingerprint components
+  [50:61] SNI character n-gram hash (11 dimensions)
 """
 
 import hashlib
@@ -21,11 +22,11 @@ from typing import Optional
 import numpy as np
 
 
-NUM_FEATURES = 40
+NUM_FEATURES = 61
 
 # --- SNI n-gram hashing ---
 
-_HASH_DIMS = 3  # dimensions for SNI hash vector
+_HASH_DIMS = 11  # expanded from 3 → 11 for better domain discrimination
 
 
 def _murmurhash3_32(key: bytes, seed: int = 0) -> int:
@@ -80,9 +81,13 @@ def sni_ngram_hash(domain: str, dims: int = _HASH_DIMS) -> np.ndarray:
     with MurmurHash3, mapped to a dimension via modulo, and accumulated with
     a sign hash for variance reduction.
 
+    Expanded from 3 → 11 dims to reduce collisions. AI provider domains
+    (api.openai.com, generativelanguage.googleapis.com, api.anthropic.com)
+    have very different n-gram distributions that were crushed together at 3 dims.
+
     Args:
         domain: SNI hostname (e.g., "api.openai.com")
-        dims: Output vector dimensionality (default 3)
+        dims: Output vector dimensionality (default 11)
 
     Returns:
         np.ndarray of shape (dims,), L2-normalized
@@ -185,21 +190,32 @@ class TLSMetadata:
     has_grpc_alpn: bool = False
     has_h2_alpn: bool = False
     cert_chain_length: int = 0
+    # TLS extension fingerprint flags
+    has_sni_extension: bool = True
+    has_sct_extension: bool = False           # signed_certificate_timestamp
+    has_status_request: bool = False          # OCSP stapling
+    has_supported_versions_13_only: bool = False  # only lists TLS 1.3
+    has_post_handshake_auth: bool = False     # common in programmatic API clients
 
 
 def tls_to_features(tls: TLSMetadata) -> np.ndarray:
     """
-    Convert TLS metadata to 7-dim numeric vector.
+    Convert TLS metadata to 12-dim numeric vector.
 
-    [0] TLS version ordinal (normalized)
-    [1] Cipher suite count (normalized)
-    [2] Extension count (normalized)
-    [3] ALPN ordinal (normalized)
-    [4] Has gRPC ALPN (binary)
-    [5] Has H2 ALPN (binary)
-    [6] Certificate chain length (normalized)
+    [0]  TLS version ordinal (normalized)
+    [1]  Cipher suite count (normalized)
+    [2]  Extension count (normalized)
+    [3]  ALPN ordinal (normalized)
+    [4]  Has gRPC ALPN (binary)
+    [5]  Has H2 ALPN (binary)
+    [6]  Certificate chain length (normalized)
+    [7]  Has SNI extension (binary)
+    [8]  Has SCT extension (binary)
+    [9]  Has OCSP status_request (binary)
+    [10] Has supported_versions with TLS 1.3 only (binary)
+    [11] Has post_handshake_auth (binary)
     """
-    features = np.zeros(7, dtype=np.float32)
+    features = np.zeros(12, dtype=np.float32)
     features[0] = _TLS_VERSION_ORD.get(tls.version, 3) / 4.0
     features[1] = min(tls.cipher_suite_count / 30.0, 1.0)
     features[2] = min(tls.extension_count / 30.0, 1.0)
@@ -207,6 +223,12 @@ def tls_to_features(tls: TLSMetadata) -> np.ndarray:
     features[4] = 1.0 if tls.has_grpc_alpn else 0.0
     features[5] = 1.0 if tls.has_h2_alpn else 0.0
     features[6] = min(tls.cert_chain_length / 5.0, 1.0)
+    # Extension fingerprint flags
+    features[7] = 1.0 if tls.has_sni_extension else 0.0
+    features[8] = 1.0 if tls.has_sct_extension else 0.0
+    features[9] = 1.0 if tls.has_status_request else 0.0
+    features[10] = 1.0 if tls.has_supported_versions_13_only else 0.0
+    features[11] = 1.0 if tls.has_post_handshake_auth else 0.0
     return features
 
 
@@ -224,6 +246,11 @@ class FlowStats:
     packet_count_downstream: int = 0
     total_bytes: int = 0
     first_n_packet_sizes: list[int] = field(default_factory=list)  # first 8 packets
+    # Directional packet sizes for asymmetry analysis
+    upstream_packet_sizes: list[int] = field(default_factory=list)
+    downstream_packet_sizes: list[int] = field(default_factory=list)
+    upstream_bytes: int = 0
+    downstream_bytes: int = 0
 
 
 def _percentile_stats(values: list[float]) -> tuple[float, float, float, float, float, float, float]:
@@ -242,18 +269,34 @@ def _percentile_stats(values: list[float]) -> tuple[float, float, float, float, 
     )
 
 
+def _directional_stats(sizes: list[int]) -> tuple[float, float, float]:
+    """Compute mean, std, p50 for a directional packet size list. Returns (0,0,0) if empty."""
+    if not sizes:
+        return (0.0, 0.0, 0.0)
+    arr = np.array(sizes, dtype=np.float32)
+    return (
+        float(np.mean(arr)) / 1500.0,
+        float(np.std(arr)) / 1500.0,
+        float(np.median(arr)) / 1500.0,
+    )
+
+
 def flow_to_features(flow: FlowStats) -> np.ndarray:
     """
-    Convert flow statistics to 16-dim numeric vector.
+    Convert flow statistics to 24-dim numeric vector.
 
-    [0:7]  Packet size stats (mean/std/min/max/p25/p50/p75), normalized by /1500
-    [7:12] IAT stats (mean/std/min/max/p50), normalized by /1.0 (seconds)
-    [12]   Flow duration (log-scaled)
-    [13]   Upstream packet count (log-scaled)
-    [14]   Downstream packet count (log-scaled)
-    [15]   Bytes per second (log-scaled)
+    [0:7]   Packet size stats (mean/std/min/max/p25/p50/p75), normalized by /1500
+    [7:12]  IAT stats (mean/std/min/max/p50), normalized by /10.0 (seconds)
+    [12]    Flow duration (log-scaled)
+    [13]    Upstream packet count (log-scaled)
+    [14]    Downstream packet count (log-scaled)
+    [15]    Bytes per second (log-scaled)
+    [16:19] Upstream packet size stats (mean/std/p50), normalized by /1500
+    [19:22] Downstream packet size stats (mean/std/p50), normalized by /1500
+    [22]    Upstream-to-downstream byte ratio
+    [23]    Upstream-to-downstream packet count ratio
     """
-    features = np.zeros(16, dtype=np.float32)
+    features = np.zeros(24, dtype=np.float32)
 
     # Packet size statistics (normalized by typical MTU)
     pkt_stats = _percentile_stats([float(s) for s in flow.packet_sizes])
@@ -275,6 +318,35 @@ def flow_to_features(flow: FlowStats) -> np.ndarray:
     # Throughput (log-scaled)
     bps = flow.total_bytes / max(flow.duration_seconds, 0.001)
     features[15] = math.log1p(bps) / math.log1p(1e9)  # normalize against 1Gbps
+
+    # --- Directional features [16:24] ---
+
+    # Upstream packet size stats (mean, std, p50)
+    up_mean, up_std, up_p50 = _directional_stats(flow.upstream_packet_sizes)
+    features[16] = up_mean
+    features[17] = up_std
+    features[18] = up_p50
+
+    # Downstream packet size stats (mean, std, p50)
+    down_mean, down_std, down_p50 = _directional_stats(flow.downstream_packet_sizes)
+    features[19] = down_mean
+    features[20] = down_std
+    features[21] = down_p50
+
+    # Byte ratio: upstream / (upstream + downstream). AI traffic is asymmetric
+    # (small prompt upstream, large streaming response downstream → low ratio)
+    total_directional = flow.upstream_bytes + flow.downstream_bytes
+    if total_directional > 0:
+        features[22] = flow.upstream_bytes / total_directional
+    else:
+        features[22] = 0.5  # neutral default
+
+    # Packet count ratio: upstream / (upstream + downstream)
+    total_pkts = flow.packet_count_upstream + flow.packet_count_downstream
+    if total_pkts > 0:
+        features[23] = flow.packet_count_upstream / total_pkts
+    else:
+        features[23] = 0.5
 
     return features
 
@@ -307,24 +379,24 @@ class FlowRecord:
 
 def extract_features(record: FlowRecord) -> np.ndarray:
     """
-    Extract the full 40-dim feature vector from a flow record.
+    Extract the full 61-dim feature vector from a flow record.
 
-    Returns np.ndarray of shape (40,) with all features normalized to ~[0, 1].
+    Returns np.ndarray of shape (61,) with all features normalized to ~[0, 1].
     """
-    flow_feats = flow_to_features(record.flow_stats)           # 16 dims
+    flow_feats = flow_to_features(record.flow_stats)           # 24 dims
     first_n_feats = first_n_to_features(
         record.flow_stats.first_n_packet_sizes, n=8
     )                                                           # 8 dims
-    tls_feats = tls_to_features(record.tls_metadata)            # 7 dims
+    tls_feats = tls_to_features(record.tls_metadata)            # 12 dims
     ja4_feats = ja4_to_features(record.ja4_components)          # 6 dims
-    sni_feats = sni_ngram_hash(record.sni_domain, dims=3)       # 3 dims
+    sni_feats = sni_ngram_hash(record.sni_domain, dims=_HASH_DIMS)  # 11 dims
 
     combined = np.concatenate([
-        flow_feats,     # [0:16]
-        first_n_feats,  # [16:24]
-        tls_feats,      # [24:31]
-        ja4_feats,      # [31:37]
-        sni_feats,      # [37:40]
+        flow_feats,     # [0:24]
+        first_n_feats,  # [24:32]
+        tls_feats,      # [32:44]
+        ja4_feats,      # [44:50]
+        sni_feats,      # [50:61]
     ])
 
     assert combined.shape == (NUM_FEATURES,), f"Expected {NUM_FEATURES} features, got {combined.shape[0]}"
@@ -333,22 +405,29 @@ def extract_features(record: FlowRecord) -> np.ndarray:
 
 # Feature names for debugging and analysis
 FEATURE_NAMES = [
-    # Flow statistics [0:16]
+    # Flow statistics [0:24]
     "pkt_size_mean", "pkt_size_std", "pkt_size_min", "pkt_size_max",
     "pkt_size_p25", "pkt_size_p50", "pkt_size_p75",
     "iat_mean", "iat_std", "iat_min", "iat_max", "iat_p50",
     "duration", "pkt_count_up", "pkt_count_down", "bytes_per_sec",
-    # First-N packet sizes [16:24]
+    "up_pkt_size_mean", "up_pkt_size_std", "up_pkt_size_p50",
+    "down_pkt_size_mean", "down_pkt_size_std", "down_pkt_size_p50",
+    "byte_ratio_up", "pkt_ratio_up",
+    # First-N packet sizes [24:32]
     "first_pkt_1", "first_pkt_2", "first_pkt_3", "first_pkt_4",
     "first_pkt_5", "first_pkt_6", "first_pkt_7", "first_pkt_8",
-    # TLS metadata [24:31]
+    # TLS metadata [32:44]
     "tls_version", "tls_cipher_count", "tls_ext_count", "tls_alpn",
     "tls_has_grpc", "tls_has_h2", "tls_cert_chain_len",
-    # JA4 components [31:37]
+    "tls_has_sni", "tls_has_sct", "tls_has_status_req",
+    "tls_13_only", "tls_post_handshake_auth",
+    # JA4 components [44:50]
     "ja4_tls_ver", "ja4_cipher_count", "ja4_ext_count", "ja4_alpn",
     "ja4_cipher_hash_0", "ja4_cipher_hash_1",
-    # SNI n-gram hash [37:40]
-    "sni_hash_0", "sni_hash_1", "sni_hash_2",
+    # SNI n-gram hash [50:61]
+    "sni_hash_0", "sni_hash_1", "sni_hash_2", "sni_hash_3",
+    "sni_hash_4", "sni_hash_5", "sni_hash_6", "sni_hash_7",
+    "sni_hash_8", "sni_hash_9", "sni_hash_10",
 ]
 
 assert len(FEATURE_NAMES) == NUM_FEATURES

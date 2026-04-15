@@ -21,7 +21,7 @@ import numpy as np
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from features import FEATURE_NAMES, NUM_FEATURES
+from features import FEATURE_NAMES, NUM_FEATURES, _HASH_DIMS
 
 # Known AI provider SNI patterns (for generating realistic positive examples)
 AI_DOMAINS = [
@@ -67,7 +67,7 @@ NORMAL_DOMAINS = [
 ]
 
 
-def _sni_ngram_hash_inline(domain: str, dims: int = 3) -> np.ndarray:
+def _sni_ngram_hash_inline(domain: str, dims: int = _HASH_DIMS) -> np.ndarray:
     """Inline SNI hash to avoid import dependency issues in standalone script."""
     import struct as _struct
 
@@ -124,16 +124,19 @@ def generate_ai_traffic(rng: np.random.Generator) -> np.ndarray:
     - Higher downstream packet counts (streaming tokens)
     - TLS 1.3, often h2 or gRPC ALPN
     - Longer flow duration (streaming responses)
+    - Strong upstream/downstream asymmetry
     """
     features = np.zeros(NUM_FEATURES, dtype=np.float32)
     domain = rng.choice(AI_DOMAINS)
 
-    # Flow statistics [0:16]
+    # --- Flow statistics [0:24] ---
+
     # AI traffic: moderate request, many small response chunks
-    pkt_sizes = np.concatenate([
-        rng.integers(200, 1400, size=rng.integers(2, 5)),     # upstream (prompts)
-        rng.integers(40, 300, size=rng.integers(20, 200)),     # downstream (token chunks)
-    ])
+    n_up = int(rng.integers(2, 5))
+    n_down = int(rng.integers(20, 200))
+    up_sizes = rng.integers(200, 1400, size=n_up)
+    down_sizes = rng.integers(40, 300, size=n_down)
+    pkt_sizes = np.concatenate([up_sizes, down_sizes])
     iats = rng.exponential(0.05, size=len(pkt_sizes))  # fast streaming
 
     features[0] = np.mean(pkt_sizes) / 1500
@@ -152,37 +155,57 @@ def generate_ai_traffic(rng: np.random.Generator) -> np.ndarray:
 
     duration = float(rng.uniform(1.0, 60.0))  # streaming can be long
     features[12] = np.log1p(duration) / np.log1p(300)
-    features[13] = np.log1p(rng.integers(2, 10)) / np.log1p(10000)  # upstream pkts
-    features[14] = np.log1p(rng.integers(20, 500)) / np.log1p(10000)  # downstream pkts
-    bps = float(np.sum(pkt_sizes)) / max(duration, 0.001)
+    features[13] = np.log1p(n_up) / np.log1p(10000)
+    features[14] = np.log1p(n_down) / np.log1p(10000)
+    total_bytes = int(np.sum(pkt_sizes))
+    bps = total_bytes / max(duration, 0.001)
     features[15] = np.log1p(bps) / np.log1p(1e9)
 
-    # First-N packet sizes [16:24]
+    # Directional stats [16:24]
+    features[16] = np.mean(up_sizes) / 1500
+    features[17] = np.std(up_sizes) / 1500 if len(up_sizes) > 1 else 0.0
+    features[18] = np.median(up_sizes) / 1500
+    features[19] = np.mean(down_sizes) / 1500
+    features[20] = np.std(down_sizes) / 1500
+    features[21] = np.median(down_sizes) / 1500
+
+    up_bytes = int(np.sum(up_sizes))
+    down_bytes = int(np.sum(down_sizes))
+    features[22] = up_bytes / (up_bytes + down_bytes)  # byte ratio (low for AI)
+    features[23] = n_up / (n_up + n_down)  # pkt ratio (low for AI)
+
+    # First-N packet sizes [24:32]
     first_n = list(pkt_sizes[:8])
     for i in range(min(len(first_n), 8)):
-        features[16 + i] = first_n[i] / 1500
+        features[24 + i] = first_n[i] / 1500
 
-    # TLS metadata [24:31]
-    features[24] = 4 / 4  # TLS 1.3
-    features[25] = rng.uniform(0.3, 0.8)  # cipher count
-    features[26] = rng.uniform(0.3, 0.7)  # extension count
+    # TLS metadata [32:44]
+    features[32] = 4 / 4  # TLS 1.3
+    features[33] = rng.uniform(0.3, 0.8)  # cipher count
+    features[34] = rng.uniform(0.3, 0.7)  # extension count
     has_grpc = rng.random() < 0.3  # 30% chance of gRPC
-    features[27] = (5 if has_grpc else 3) / 5  # ALPN (grpc or h2)
-    features[28] = 1.0 if has_grpc else 0.0
-    features[29] = 1.0  # h2 almost always
-    features[30] = rng.uniform(0.4, 0.8)  # cert chain length
+    features[35] = (5 if has_grpc else 3) / 5  # ALPN (grpc or h2)
+    features[36] = 1.0 if has_grpc else 0.0
+    features[37] = 1.0  # h2 almost always
+    features[38] = rng.uniform(0.4, 0.8)  # cert chain length
+    # TLS extension flags
+    features[39] = 1.0  # has SNI (always for AI APIs)
+    features[40] = 1.0 if rng.random() < 0.7 else 0.0  # SCT common
+    features[41] = 1.0 if rng.random() < 0.6 else 0.0  # OCSP
+    features[42] = 1.0 if rng.random() < 0.8 else 0.0  # TLS 1.3 only (high for API clients)
+    features[43] = 1.0 if rng.random() < 0.5 else 0.0  # post_handshake_auth
 
-    # JA4 components [31:37]
-    features[31] = 4 / 4
-    features[32] = rng.uniform(0.3, 0.7)
-    features[33] = rng.uniform(0.3, 0.6)
-    features[34] = features[27]
-    features[35] = rng.random()  # cipher hash dim 0
-    features[36] = rng.random()  # cipher hash dim 1
+    # JA4 components [44:50]
+    features[44] = 4 / 4
+    features[45] = rng.uniform(0.3, 0.7)
+    features[46] = rng.uniform(0.3, 0.6)
+    features[47] = features[35]
+    features[48] = rng.random()  # cipher hash dim 0
+    features[49] = rng.random()  # cipher hash dim 1
 
-    # SNI n-gram hash [37:40]
+    # SNI n-gram hash [50:61]
     sni_hash = _sni_ngram_hash_inline(domain)
-    features[37:40] = sni_hash
+    features[50:50 + _HASH_DIMS] = sni_hash
 
     # Add noise
     features += rng.normal(0, 0.02, size=NUM_FEATURES).astype(np.float32)
@@ -198,15 +221,18 @@ def generate_normal_traffic(rng: np.random.Generator) -> np.ndarray:
     - Shorter flow durations (page loads complete quickly)
     - More uniform packet sizes
     - Mixed TLS versions, often h2 or http/1.1
+    - More symmetric upstream/downstream ratio than AI traffic
     """
     features = np.zeros(NUM_FEATURES, dtype=np.float32)
     domain = rng.choice(NORMAL_DOMAINS)
 
-    # Flow statistics [0:16]
-    pkt_sizes = np.concatenate([
-        rng.integers(100, 600, size=rng.integers(1, 5)),       # requests
-        rng.integers(500, 1460, size=rng.integers(5, 50)),     # responses (larger chunks)
-    ])
+    # --- Flow statistics [0:24] ---
+
+    n_up = int(rng.integers(1, 5))
+    n_down = int(rng.integers(5, 50))
+    up_sizes = rng.integers(100, 600, size=n_up)
+    down_sizes = rng.integers(500, 1460, size=n_down)
+    pkt_sizes = np.concatenate([up_sizes, down_sizes])
     iats = rng.exponential(0.2, size=len(pkt_sizes))  # slower than streaming
 
     features[0] = np.mean(pkt_sizes) / 1500
@@ -225,37 +251,57 @@ def generate_normal_traffic(rng: np.random.Generator) -> np.ndarray:
 
     duration = float(rng.uniform(0.1, 10.0))  # typically shorter
     features[12] = np.log1p(duration) / np.log1p(300)
-    features[13] = np.log1p(rng.integers(1, 10)) / np.log1p(10000)
-    features[14] = np.log1p(rng.integers(5, 100)) / np.log1p(10000)
-    bps = float(np.sum(pkt_sizes)) / max(duration, 0.001)
+    features[13] = np.log1p(n_up) / np.log1p(10000)
+    features[14] = np.log1p(n_down) / np.log1p(10000)
+    total_bytes = int(np.sum(pkt_sizes))
+    bps = total_bytes / max(duration, 0.001)
     features[15] = np.log1p(bps) / np.log1p(1e9)
 
-    # First-N packet sizes [16:24]
+    # Directional stats [16:24]
+    features[16] = np.mean(up_sizes) / 1500
+    features[17] = np.std(up_sizes) / 1500 if len(up_sizes) > 1 else 0.0
+    features[18] = np.median(up_sizes) / 1500
+    features[19] = np.mean(down_sizes) / 1500
+    features[20] = np.std(down_sizes) / 1500
+    features[21] = np.median(down_sizes) / 1500
+
+    up_bytes = int(np.sum(up_sizes))
+    down_bytes = int(np.sum(down_sizes))
+    features[22] = up_bytes / (up_bytes + down_bytes)  # byte ratio (higher for normal)
+    features[23] = n_up / (n_up + n_down)  # pkt ratio (higher for normal)
+
+    # First-N packet sizes [24:32]
     first_n = list(pkt_sizes[:8])
     for i in range(min(len(first_n), 8)):
-        features[16 + i] = first_n[i] / 1500
+        features[24 + i] = first_n[i] / 1500
 
-    # TLS metadata [24:31]
+    # TLS metadata [32:44]
     tls_ver = rng.choice([3, 4], p=[0.3, 0.7])  # mix of 1.2 and 1.3
-    features[24] = tls_ver / 4
-    features[25] = rng.uniform(0.2, 0.9)
-    features[26] = rng.uniform(0.2, 0.8)
-    features[27] = rng.choice([2, 3]) / 5  # http/1.1 or h2
-    features[28] = 0.0  # no gRPC
-    features[29] = 1.0 if rng.random() < 0.7 else 0.0  # h2 common
-    features[30] = rng.uniform(0.2, 0.8)
+    features[32] = tls_ver / 4
+    features[33] = rng.uniform(0.2, 0.9)
+    features[34] = rng.uniform(0.2, 0.8)
+    features[35] = rng.choice([2, 3]) / 5  # http/1.1 or h2
+    features[36] = 0.0  # no gRPC
+    features[37] = 1.0 if rng.random() < 0.7 else 0.0  # h2 common
+    features[38] = rng.uniform(0.2, 0.8)  # cert chain length
+    # TLS extension flags (more varied for normal traffic)
+    features[39] = 1.0 if rng.random() < 0.95 else 0.0  # SNI (almost always)
+    features[40] = 1.0 if rng.random() < 0.4 else 0.0   # SCT less common
+    features[41] = 1.0 if rng.random() < 0.5 else 0.0   # OCSP
+    features[42] = 1.0 if rng.random() < 0.3 else 0.0   # TLS 1.3 only (lower for browsers)
+    features[43] = 1.0 if rng.random() < 0.1 else 0.0   # post_handshake_auth (rare)
 
-    # JA4 components [31:37]
-    features[31] = tls_ver / 4
-    features[32] = rng.uniform(0.2, 0.8)
-    features[33] = rng.uniform(0.2, 0.7)
-    features[34] = features[27]
-    features[35] = rng.random()
-    features[36] = rng.random()
+    # JA4 components [44:50]
+    features[44] = tls_ver / 4
+    features[45] = rng.uniform(0.2, 0.8)
+    features[46] = rng.uniform(0.2, 0.7)
+    features[47] = features[35]
+    features[48] = rng.random()
+    features[49] = rng.random()
 
-    # SNI n-gram hash [37:40]
+    # SNI n-gram hash [50:61]
     sni_hash = _sni_ngram_hash_inline(domain)
-    features[37:40] = sni_hash
+    features[50:50 + _HASH_DIMS] = sni_hash
 
     # Add noise
     features += rng.normal(0, 0.02, size=NUM_FEATURES).astype(np.float32)
@@ -276,7 +322,7 @@ def generate_dataset(
         seed: Random seed for reproducibility
 
     Returns:
-        X: Feature matrix (n_samples, 40)
+        X: Feature matrix (n_samples, NUM_FEATURES)
         y: Labels (n_samples,) — 1.0 for AI traffic, 0.0 for normal
     """
     rng = np.random.default_rng(seed)
