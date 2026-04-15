@@ -4,7 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-models/*.onnx
+
 models/*.json
 data/*.csv
 .venv/
